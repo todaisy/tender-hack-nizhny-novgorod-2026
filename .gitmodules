@@ -1,0 +1,19 @@
+[submodule "services/backend"]
+	path = services/backend
+	url = https://github.com/Gospoduu/AlphaRAG.hack.git
+	branch = develop
+
+[submodule "services/analytics"]
+	path = services/analytics
+	url = https://github.com/todaisy/RLT_analytics.git
+	branch = main
+
+[submodule "services/ml"]
+	path = services/ml
+	url = https://github.com/ardont/MAESTRO.git
+	branch = main_fork
+
+[submodule "services/support"]
+	path = services/support
+	url = https://github.com/Gospoduu/support_service.git
+	branch = main

@@ -1,0 +1,414 @@
+name: tender-hack-2026
+
+services:
+
+  # KAFKA
+  kafka:
+    image: confluentinc/cp-kafka:7.9.0
+    restart: unless-stopped
+
+    ports:
+      - "9092:9092"
+
+    environment:
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+      KAFKA_NODE_ID: 1
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+
+      KAFKA_LISTENERS: >-
+        PLAINTEXT://kafka:29092,
+        PLAINTEXT_HOST://0.0.0.0:9092,
+        CONTROLLER://kafka:29093
+
+      KAFKA_ADVERTISED_LISTENERS: >-
+        PLAINTEXT://kafka:29092,
+        PLAINTEXT_HOST://localhost:9092
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >-
+        CONTROLLER:PLAINTEXT,
+        PLAINTEXT:PLAINTEXT,
+        PLAINTEXT_HOST:PLAINTEXT
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1"
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    restart: unless-stopped
+
+    ports:
+      - "8081:8080"
+
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+
+  # BACKEND INFRASTRUCTURE
+  backend-postgres:
+    image: postgres:17
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${BACKEND_POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${BACKEND_POSTGRES_PASSWORD:-1234567890}
+      POSTGRES_DB: ${BACKEND_POSTGRES_DB:-mydb}
+
+    ports:
+      - "${BACKEND_POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      - backend_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${BACKEND_POSTGRES_USER:-appuser} -d ${BACKEND_POSTGRES_DB:-mydb}"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+
+  backend-redis:
+    image: redis:7
+    restart: unless-stopped
+
+    ports:
+      - "${BACKEND_REDIS_PORT:-6479}:6379"
+
+    volumes:
+      - backend_redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+
+  backend:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      DATABASE_URL: >-
+        postgresql+asyncpg://${BACKEND_POSTGRES_USER:-appuser}:${BACKEND_POSTGRES_PASSWORD:-1234567890}@backend-postgres:5432/${BACKEND_POSTGRES_DB:-mydb}
+
+      REDIS_URL: redis://backend-redis:6379/0
+
+      KAFKA_URL: kafka:29092
+
+    depends_on:
+      backend-postgres:
+        condition: service_healthy
+
+      backend-redis:
+        condition: service_healthy
+
+      kafka:
+        condition: service_healthy
+
+    command: >
+      bash -lc "
+      python -m Back.infra.redis.start_redis &&
+      python -m Back.infra.db.start_db &&
+      uvicorn Back.main:app --host 0.0.0.0 --port 8000
+      "
+
+  # ML / MAESTRO INFRASTRUCTURE
+  qdrant:
+    image: qdrant/qdrant:v1.19.0
+    restart: unless-stopped
+
+    ports:
+      - "${QDRANT_BIND_ADDRESS:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
+
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+
+  ml-redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+
+    volumes:
+      - ml_redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+
+  rag:
+    &rag-runtime
+
+    image: maestro-rag
+
+    build:
+      context: ./services/ml
+      dockerfile: Dockerfile
+
+      args:
+        PIP_INDEX_URL: ${BUILD_PIP_INDEX_URL:-https://pypi.org/simple}
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+
+    restart: unless-stopped
+    init: true
+
+    stop_grace_period: 30s
+
+    command:
+      [
+        "faststream",
+        "run",
+        "chat.kafka.broker:app",
+        "--workers",
+        "1"
+      ]
+
+    volumes:
+      - python_cache:/root/.cache
+      - ./services/ml/media:/app/media
+
+      - type: bind
+        source: ${EMBEDDING_MODEL_HOST_PATH}
+        target: /models/ru-en-RoSBERTa
+        read_only: true
+
+    environment:
+      FASTAPI_PORT: 8889
+
+      REDIS_HOST: ml-redis
+      REDIS_PORT: 6379
+
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      QDRANT_MODE: server
+
+      AUTO_INDEX_ON_START: "false"
+
+      EMBEDDING_MODEL_NAME: /models/ru-en-RoSBERTa
+
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:20b}
+
+      RAG_PUBLIC_URL: ${RAG_PUBLIC_URL:-http://localhost:8889}
+
+      MEMORY_OLLAMA_TIMEOUT: ${MEMORY_OLLAMA_TIMEOUT:-180}
+
+      # ВАЖНО: Docker DNS, а не localhost
+      SUPPORT_SERVICE_URL: http://support:8067
+
+      KAFKA_URL: kafka:29092
+
+      LLM_REQUEST_TOPIC: ${LLM_REQUEST_TOPIC:-llm-requests}
+      LLM_RESPONSE_TOPIC: ${LLM_RESPONSE_TOPIC:-llm-responses}
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    depends_on:
+      qdrant:
+        condition: service_started
+
+      ml-redis:
+        condition: service_healthy
+
+      kafka:
+        condition: service_healthy
+
+
+  memory-api:
+    <<: *rag-runtime
+
+    command:
+      [
+        "uvicorn",
+        "rag.api.dialogs_memory:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8889"
+      ]
+
+    ports:
+      - "${MEMORY_API_PORT:-8889}:8889"
+
+
+  # SUPPORT SERVICE
+
+  support-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${SUPPORT_POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${SUPPORT_POSTGRES_PASSWORD:-1234567890}
+      POSTGRES_DB: ${SUPPORT_POSTGRES_DB:-mydb}
+
+    ports:
+      - "${SUPPORT_POSTGRES_PORT:-5467}:5432"
+
+    volumes:
+      - support_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${SUPPORT_POSTGRES_USER:-appuser} -d ${SUPPORT_POSTGRES_DB:-mydb}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  support:
+    build:
+      context: ./services/support
+      dockerfile: Dockerfile
+
+    restart: on-failure
+
+    ports:
+      - "${SUPPORT_PORT:-8067}:8067"
+
+    env_file:
+      - .env
+
+    environment:
+      DATABASE_URL: >-
+        postgresql+asyncpg://${SUPPORT_POSTGRES_USER:-appuser}:${SUPPORT_POSTGRES_PASSWORD:-1234567890}@support-postgres:5432/${SUPPORT_POSTGRES_DB:-mydb}
+
+      KAFKA_URL: kafka:29092
+
+      # Seed a labelled demo operator only when the operator table is empty.
+      SUPPORT_DEMO_OPERATOR: ${SUPPORT_DEMO_OPERATOR:-true}
+
+      SUPPORT_REQUEST_TOPIC: ${SUPPORT_REQUEST_TOPIC:-support_request}
+      SUPPORT_RESPONSE_TOPIC: ${SUPPORT_RESPONSE_TOPIC:-support_response}
+
+      # Исправлено 8989 -> 8889
+      MAESTRO_MEMORY_URL: ${MAESTRO_MEMORY_URL:-http://memory-api:8889/memory}
+
+      MAESTRO_MEMORY_TIMEOUT: ${MAESTRO_MEMORY_TIMEOUT:-300}
+
+    depends_on:
+      support-postgres:
+        condition: service_healthy
+
+      kafka:
+        condition: service_healthy
+
+      memory-api:
+        condition: service_started
+
+
+  # ANALYTICS
+  prometheus:
+    image: prom/prometheus:v3.7.0
+    restart: unless-stopped
+
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=2GB
+
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - ./services/analytics/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+    mem_limit: 512m
+    cpus: 0.5
+
+
+  grafana:
+    image: grafana/grafana:12.3.0
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: >-
+        /var/lib/grafana/dashboards/rlt-overview.json
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./services/analytics/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./services/analytics/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+    mem_limit: 256m
+    cpus: 0.5
+
+    depends_on:
+      - prometheus
+
+
+# VOLUMES
+volumes:
+  backend_postgres_data:
+  backend_redis_data:
+
+  support_postgres_data:
+
+  qdrant_data:
+  ml_redis_data:
+  python_cache:
+
+  prometheus_data:
+  grafana_data:
+
+
