@@ -1,7 +1,7 @@
 [submodule "services/backend"]
 	path = services/backend
 	url = https://github.com/Gospoduu/AlphaRAG.hack.git
-	branch = develop
+	branch = develop-local
 
 [submodule "services/analytics"]
 	path = services/analytics
